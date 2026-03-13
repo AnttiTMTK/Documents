@@ -13,7 +13,7 @@ Evaluate the NVIDIA DGX Spark (Grace Blackwell GB10) as a platform for GPU-accel
 1. **Deployed and validated the full OAI 5G stack** (Core Network + gNB + UE) on the DGX Spark to establish a working baseline
 2. **Explored gNB-side GPU acceleration** using NVIDIA Aerial cuBB as a proof of concept for Blackwell sm_120 GPU compute, demonstrating that the platform is capable of real-time 5G PHY processing
 
-This provides the foundation for future UE-side CUDA kernel development on the same hardware.
+> **Note on UE CUDA support**: OAI does include a CUDA-accelerated LDPC decoder (`nrLDPC_decoder_LYC.cu`) that is shared between gNB and UE via a dynamic library (`libldpc_cuda.so`). However, it is hardcoded to `sm_60`, documented as "untested from softmodem", and only covers the LDPC decoder — not the full PHY pipeline (channel estimation, FFT, demodulation, etc.). The gNB-side Aerial cuBB SDK provides a complete, production-grade GPU PHY stack, making it the more practical starting point for validating the DGX Spark's 5G capabilities.
 
 ## Test Setup
 
@@ -58,7 +58,7 @@ graph LR
 | **Phase 2: GPU slot processing** | PARTIAL | 50+ DL slots processed before TxRequestUplane exhaustion |
 | **Phase 2: cuPHY GPU unit tests** | COMPLETED | 250+ tests passing on sm_120, profiled with Nsight Systems |
 | **Phase 2: Nsight Systems profiling** | COMPLETED | 11 GPU profiles captured (7 kernel test suites + 4 additional) |
-| **Future: UE-side CUDA kernels** | NOT STARTED | OAI NR-UE PHY has no CUDA implementations yet |
+| **Future: UE-side GPU acceleration** | NOT STARTED | OAI has LDPC CUDA decoder (sm_60, untested in softmodem); rest of UE PHY is CPU-only |
 
 ## Changes Made
 
@@ -201,13 +201,23 @@ Full 5G data plane functional on DGX Spark ARM64 — UE successfully registers, 
 
 ### Why gNB-Side GPU Acceleration Next
 
-The primary interest is **UE-side GPU acceleration** (offloading NR-UE PHY to the Blackwell GPU). However, OAI's NR-UE does not currently have CUDA kernel implementations for PHY algorithms (LDPC decode, channel estimation, FFT, etc.). NVIDIA's Aerial cuBB SDK provides production-ready CUDA kernels for gNB PHY — making gNB-side the fastest path to validate that:
+The primary interest is **UE-side GPU acceleration**. OAI does include a CUDA LDPC decoder (`nrLDPC_decoder_LYC.cu`) shared by both gNB and UE via `libldpc_cuda.so`, but it has significant limitations:
+
+| Aspect | OAI LDPC CUDA | Aerial cuBB (gNB) |
+|--------|---------------|-------------------|
+| Coverage | LDPC decoder only | Full PHY pipeline (LDPC, FFT, channel est., modulation, etc.) |
+| Architecture | Hardcoded `sm_60` | Supports sm_80/90, ported to sm_120 in this project |
+| Maturity | "Untested from softmodem" (per OAI docs) | Production-grade, deployed in commercial systems |
+| Encoder | CPU only (C) | CUDA |
+| Other PHY blocks | None (CPU) | All GPU-accelerated |
+
+NVIDIA's Aerial cuBB SDK provides a complete GPU PHY stack for gNB — making gNB-side the fastest path to validate that:
 
 1. The DGX Spark Blackwell GPU (sm_120) can execute real-time 5G PHY workloads
 2. The unified memory architecture works for PHY processing pipelines
 3. CUDA kernel performance on sm_120 meets 5G timing requirements
 
-These findings directly inform a future UE-side CUDA effort on the same hardware.
+These findings directly inform a future UE-side CUDA effort — starting with updating the existing LDPC CUDA decoder to sm_120, then extending to other PHY blocks.
 
 ---
 
@@ -581,20 +591,21 @@ gantt
 
 ### UE-Side GPU Acceleration (Primary Goal)
 
-1. **Identify UE PHY hotspots**: Profile OAI NR-UE CPU PHY to find CUDA offload candidates (LDPC decode, channel estimation, FFT/IFFT, demodulation)
-2. **Develop UE CUDA kernels**: Port key NR-UE PHY algorithms to CUDA targeting sm_120, leveraging cuPHY kernel patterns from gNB trial
-3. **Validate on DGX Spark**: Run GPU-accelerated NR-UE against the same RFsimulator gNB from Phase 1, compare throughput and latency vs CPU baseline
+1. **Update existing LDPC CUDA decoder**: Port `nrLDPC_decoder_LYC.cu` from sm_60 to sm_120, validate with `nr-uesoftmodem` (currently documented as untested)
+2. **Profile UE PHY hotspots**: Profile OAI NR-UE CPU PHY to identify next CUDA offload candidates (channel estimation, FFT/IFFT, demodulation)
+3. **Develop additional UE CUDA kernels**: Port key NR-UE PHY algorithms to CUDA targeting sm_120, leveraging cuPHY kernel patterns from gNB trial
+4. **Validate on DGX Spark**: Run GPU-accelerated NR-UE against the same RFsimulator gNB from Phase 1, compare throughput and latency vs CPU baseline
 
 ### gNB-Side Completion (Secondary)
 
-4. **Connect O-RU**: Attach O-RU to ConnectX-7 NIC (VLAN 564, eCPRI) for real fronthaul data
-5. **E2E Throughput Test**: Measure GPU-accelerated gNB PHY throughput vs Phase 1 CPU baseline (105 Mbps)
-6. **Full L1 Profiling**: Capture per-slot task tracing, PMU Topdown, and Nsight Systems timeline during stable operation
+5. **Connect O-RU**: Attach O-RU to ConnectX-7 NIC (VLAN 564, eCPRI) for real fronthaul data
+6. **E2E Throughput Test**: Measure GPU-accelerated gNB PHY throughput vs Phase 1 CPU baseline (105 Mbps)
+7. **Full L1 Profiling**: Capture per-slot task tracing, PMU Topdown, and Nsight Systems timeline during stable operation
 
 ### Platform Improvements
 
-7. **MOK Enrollment**: Enable nvidia-peermem for GPUDirect RDMA (requires physical access + reboot)
-8. **Multi-UE scaling**: Validate MPS context switching under multi-UE load
+8. **MOK Enrollment**: Enable nvidia-peermem for GPUDirect RDMA (requires physical access + reboot)
+9. **Multi-UE scaling**: Validate MPS context switching under multi-UE load
 
 ---
 
