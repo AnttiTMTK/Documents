@@ -37,7 +37,7 @@ graph LR
     P2A --> P2B["L1 GPU Init<br/>8 CUDA ctx"]
     P2B --> P2C["FAPI Link<br/>L1+L2 connected"]
     P2C --> P2D["GPU Slot Processing<br/>50+ DL slots"]
-    P2D --> P2E["GPU Kernel Tests<br/>250+ passing"]
+    P2D --> P2E["GPU Profiling<br/>LDPC 8.6 Gbps<br/>21 profiles"]
     P2E --> P3["Future<br/>UE CUDA Kernels"]
 
     style P1 fill:#2d6a4f,stroke:#40916c,color:#fff
@@ -57,7 +57,7 @@ graph LR
 | **Phase 2: L1+L2 FAPI integration** | COMPLETED | CONFIG/START handshake over nvIPC SHM |
 | **Phase 2: GPU slot processing** | PARTIAL | 50+ DL slots processed before TxRequestUplane exhaustion |
 | **Phase 2: cuPHY GPU unit tests** | COMPLETED | 250+ tests passing on sm_120, profiled with Nsight Systems |
-| **Phase 2: Nsight Systems profiling** | COMPLETED | 11 GPU profiles captured (7 kernel test suites + 4 additional) |
+| **Phase 2: Nsight Systems profiling** | COMPLETED | 21 GPU profiles, per-kernel timing for LDPC/modulation/scrambling/rate-matching/BFW |
 | **Future: UE-side GPU acceleration** | NOT STARTED | OAI has LDPC CUDA decoder (sm_60, untested in softmodem); rest of UE PHY is CPU-only |
 
 ## Changes Made
@@ -425,38 +425,111 @@ graph TD
 
 ### 2.10 Nsight Systems GPU Profiling — COMPLETED
 
-11 Nsight Systems profiles captured (7.6 MB total) with `nsys profile --trace=cuda,nvtx,osrt`:
+21 Nsight Systems profiles captured with `nsys profile --trace=cuda,nvtx,osrt`, covering individual CUDA kernels for all major PHY algorithms. Kernel execution times extracted from `CUPTI_ACTIVITY_KIND_KERNEL` tables in exported SQLite files.
 
-**Unit Test Kernel Profiles (7 test suites)**:
+#### LDPC Encode/Decode (Error Correction)
 
-| Test Suite | Key Kernel | Avg Latency | Instances | Status |
-|------------|-----------|-------------|-----------|--------|
-| Descrambling | `descrambleKernel` | 15.4 µs | 1001 | PASS |
-| Modulation Mapper | `modulation_mapper` | 52.2 µs | 357 | PASS |
-| BFW Compression | `kcomp<float,64,16>` | 77.5 µs | 1 | PASS |
-| BFW Decompression | `kdecomp<float,64,16>` | 4.4 µs | 1 | PASS |
-| LDPC Internal | `rc_fp16_signs_dp` | 5.9 µs | 9 | PASS |
-| Critical Path | `vecAdd/Sub/Mul/Div/Sqr` | 0.8-1.3 µs | 5 | PASS |
-| Reduction | `tensor_reduction_kernel` | 2.8-5.9 µs | 10 | PASS |
+The cuPHY LDPC example generates its own test data, enabling comprehensive profiling across configurations:
 
-**Additional Profiles Captured**:
+| Configuration | Key Kernel | Avg (µs) | Throughput | Codewords |
+|---------------|-----------|----------|------------|-----------|
+| BG1, 8448b, R=0.5, QPSK, 8 iter, FP32 | `ldpc2_BG1_reg_index_fp_desc_dyn_fp32` | 118.98 | **5.66 Gbps** | 80 |
+| BG2, 3840b, R=0.33, QAM64, 8 iter, FP32 | `ldpc2_BG2_reg_index_fp_desc_dyn_fp32` | 77.64 | **3.83 Gbps** | 80 |
+| BG1, 8448b, R=0.5, QAM256, 8 iter, FP16 TB | `ldpc2_BG1_split_index_fp_x2_desc_dyn_tb` | 76.40 | **8.62 Gbps** | 80 |
+| BG1, 8448b, R=0.5, QPSK, 1 iter, FP32 | `ldpc2_BG1_reg_index_fp_desc_dyn_fp32` | 22.16 | **29.32 Gbps** | 80 |
 
-| Profile | Size | Content |
-|---------|------|---------|
-| `aerial_20260312_124956.sqlite` | 328 KB | cuphycontroller_scf main process (startup only — crashed before stable profiling due to DPDK+nsys conflict) |
-| `cfo_ta.sqlite` | 740 KB | CFO & Timing Advance estimation kernels |
-| `pucch.sqlite` | 59 KB | PUCCH receiver kernels |
-| `pdsch_tx.sqlite` | 57 KB | PDSCH transmit example |
+> FP16 transport block mode achieves **52% higher throughput** (8.62 vs 5.66 Gbps) than FP32 at the same 8 iterations, demonstrating Blackwell's FP16 tensor advantage.
 
-CUDA API hotspot: `cuLibraryLoadData` at 542 ms (64.7%) — one-time module loading overhead.
+Supporting LDPC kernels:
+
+| Kernel | Purpose | Avg (µs) | Calls |
+|--------|---------|----------|-------|
+| `ldpc_encode_in_bit_kernel` | LDPC encoding | 10.40 | 1 |
+| `address_pairs_compare_desc` | LDPC APP address generation | 42.12 | 3 |
+| `test_rc_fp16_signs_dp_kernel` | Row-column FP16 operations | 9.45 | 9 |
+| `test_box_plus_kernel` | Box-plus min-sum | 3.42 | 9 |
+
+#### Modulation & Demodulation
+
+| Test | Key Kernel | Avg (µs) | Min (µs) | Max (µs) | Calls |
+|------|-----------|----------|----------|----------|-------|
+| Modulation Mapper (all QAM orders) | `modulation_mapper` | 66.76 | 1.34 | 2,764.64 | 357 |
+| Symbol Demodulator (QAM256, 1024 sym) | `soft_demapper_kernel` | 3.01 | 2.72 | 5.25 | 10 |
+| Symbol Demodulator (FP16 HDF5 input) | `soft_demapper_kernel` | 3.08 | 2.75 | 5.89 | 10 |
+| Soft Demapper (internal test) | `test_soft_demapper_kernel` | 4.38 | 2.69 | 5.57 | 5 |
+
+> Symbol demodulation completes in **~3 µs** — well within the 500 µs per-slot budget for NR 30 kHz SCS.
+
+#### Scrambling & Rate Matching
+
+| Test | Key Kernel | Avg (µs) | Min (µs) | Max (µs) | Calls |
+|------|-----------|----------|----------|----------|-------|
+| Descrambling (LFSR + Galois) | `descrambleKernel` | 18.16 | 14.91 | 2,420.86 | 1,001 |
+| DL Rate Matching | `dl_rate_matching` | 13.55 | 6.56 | 36.70 | 280 |
+
+#### Beamforming (BFW Compression)
+
+| Kernel | Purpose | Avg (µs) |
+|--------|---------|----------|
+| `gen_sequenced` | BFW weight generation | 410.46 |
+| `generate_seed_pseudo` | Pseudo-random seed | 131.97 |
+| `kcomp` | BFW compression | 100.77 |
+| `kdecomp` | BFW decompression | 3.87 |
+
+#### Utility / Infrastructure Kernels
+
+| Kernel | Purpose | Avg (µs) | Calls |
+|--------|---------|----------|-------|
+| `cuphy_rng_init` | CUDA RNG initialization | 250-256 | per test |
+| `tensor_rng_kernel` | Random data generation | 7-1,417 | varies by size |
+| `convert_kernel` | Data type conversion | 2.45 | 118 |
+| `tensor_elementwise_binary_kernel` | Elementwise operations | 6.32 | 22 |
+| `tensor_reduction_kernel` | Tensor reduction | 4.92 | 10 |
+
+#### Channel-Level Pipeline Profiling — LIMITED BY TEST VECTORS
+
+Higher-level channel processing pipelines (PDSCH TX, PUSCH RX, PUCCH receivers, channel estimation/equalization, SRS, CSI-RS, PDCCH) require HDF5 test vector files. In the container, these are Git LFS pointers (131 bytes each), not actual data. The following tests were identified but could not be profiled:
+
+| Pipeline Test | Binary | Requirement |
+|---------------|--------|-------------|
+| PDSCH transmit | `cuphy_ex_pdsch_tx` | HDF5 test vector (`-i`) |
+| PUSCH receive | `cuphy_ex_pusch_rx_multi_pipe` | HDF5 test vector |
+| Channel estimation | `cuphy_ex_channel_est`, `cuphy_ex_ch_est` | HDF5 test vector |
+| Channel equalization | `cuphy_ex_channel_eq` | HDF5 test vector |
+| PUCCH F0/F1/F2/F3 | `cuphy_ex_pucch_*` | HDF5 or YAML config |
+| SRS processing | `cuphy_ex_srs_*` | YAML config |
+| SSB transmit | `cuphy_ex_ssb_tx_multi_cell` | YAML config |
+| PDCCH transmit | `cuphy_ex_pdcch_tx_multi_cell` | YAML config |
+| OFDM mod/demod | `ofdm_mod_demod` | **FAILS**: "Unsupported IFFT length 4096 or cudaDeviceArch 1210" — sm_120 not in supported list |
+| Full PUSCH+PDSCH | `cubb_gpu_test_bench` | YAML config with test vectors |
+
+> **Note**: Unit-test-level kernels for CFO/TA estimation, de-rate matching, CSI-RS, and PUCCH produced no GPU kernel data — these tests exercise CPU-only code paths in the unit test framework. The actual GPU kernels for these functions execute within the higher-level pipeline tests above.
+
+#### Summary: Kernel Execution Time Spectrum on GB10
+
+```
+LDPC decode (8 iter, BG1, FP16):  ████████████████████████████████████████  76.4 µs → 8.62 Gbps
+LDPC decode (8 iter, BG1, FP32):  ██████████████████████████████████████████████████████████████ 119.0 µs → 5.66 Gbps
+Modulation mapper:                █████████████████████████████████████ 66.8 µs (avg, varies by QAM)
+BFW compression:                  ████████████████████████████████████████████████████ 100.8 µs
+LDPC address gen:                 ██████████████████████ 42.1 µs
+Descrambling:                     ██████████ 18.2 µs
+DL rate matching:                 ███████ 13.6 µs
+LDPC encode:                      █████ 10.4 µs
+Tensor reduction:                 ██ 4.9 µs
+Soft demapper:                    █ 3.0 µs
+BFW decompression:                █ 3.9 µs
+Data conversion:                  █ 2.5 µs
+```
 
 **Profiling limitations** (data NOT captured):
-- Live GPU kernel traces during L1 slot processing — L1 crashes before profiler_sec window completes
-- SM occupancy/utilization — crash occurs during stall, no profiler snapshots
-- Memory bandwidth statistics — U-plane transfers blocked, no traffic captured
-- Per-slot task tracing + PMU Topdown — requires stable slot processing (needs O-RU)
+- Channel-level pipeline kernels (PDSCH/PUSCH/PUCCH/SRS/channel est/eq) — require HDF5 test vector files (Git LFS, not available in container)
+- Live GPU kernel traces during L1 slot processing — L1 crashes before profiler window completes without O-RU
+- SM occupancy/utilization — no stable slot processing for profiler snapshots
+- Memory bandwidth statistics — U-plane transfers blocked without fronthaul data
+- Per-slot task tracing + PMU Topdown — requires stable operation (needs O-RU)
 
-All `.nsys-rep` and `.sqlite` report files saved to `/tmp/aerial-nsys/` for GUI analysis.
+All 21 `.nsys-rep` and `.sqlite` report files saved to `/tmp/aerial-nsys/` for GUI analysis.
 
 ---
 
