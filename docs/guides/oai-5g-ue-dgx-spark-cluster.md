@@ -153,15 +153,18 @@ This is the most labor-intensive challenge. OAI PHY is heavily optimized with x8
 | **Horizontal ops** | hadd, hsub, dpbusd | Limited pairwise add | ADDV, FADDV reductions |
 | **Gather/Scatter** | All element sizes | Not available | 32/64-bit elements only |
 
-#### 4.1.2 Core Microarchitecture Comparison: AVX-512 (Xeon) vs Cortex-X925 vs Cortex-A725
+#### 4.1.2 Core Microarchitecture Comparison: Xeon 2 GHz (32-core) vs Cortex-X925 vs Cortex-A725
+
+**Reference platform:** Intel Xeon 2.0 GHz, 32 cores with AVX-512 (representative of server-class OAI deployments).
 
 The GB10 contains two distinct core types in a big.LITTLE configuration. Their vector capabilities differ significantly:
 
-| Feature | Intel Xeon (AVX-512) | Cortex-X925 (Performance) | Cortex-A725 (Efficiency) |
+| Feature | Intel Xeon 2 GHz (32-core) | Cortex-X925 (Performance) | Cortex-A725 (Efficiency) |
 |---|---|---|---|
 | **Architecture** | x86-64 | ARMv9.2-A | ARMv9.2-A |
-| **Role in GB10** | N/A (reference) | Performance cores (10x) | Efficiency cores (10x) |
-| **Clock frequency (GB10)** | 3.0-4.0 GHz (typical Xeon) | 3.9-4.0 GHz | 2.8 GHz |
+| **Role** | Reference server platform | GB10 performance cores (10x) | GB10 efficiency cores (10x) |
+| **Core count** | 32 | 10 (per GB10 node) | 10 (per GB10 node) |
+| **Clock frequency** | 2.0 GHz (base) | 3.9-4.0 GHz | 2.8 GHz |
 | **Decode width** | 6-wide (typical) | 10-wide | 5-wide |
 | **SIMD/Vector pipes** | 2 x 512-bit | **6 x 128-bit** | **2 x 128-bit** |
 | **Effective SIMD bits/cycle** | 1024 bits | **768 bits** | **256 bits** |
@@ -172,7 +175,8 @@ The GB10 contains two distinct core types in a big.LITTLE configuration. Their v
 | **Reorder buffer** | 512+ entries (typical) | ~400+ entries (est.) | 224 entries |
 | **L1D cache** | 48 KB (typical) | 64 KB, 4-cycle | 64 KB, 4-cycle |
 | **L2 cache** | 1.25-2 MB (typical) | 2 MB, 12-cycle | 512 KB, 9-cycle |
-| **L3 cache (GB10)** | 30-60 MB (typical Xeon) | 8-16 MB (shared cluster) | 8-16 MB (shared cluster) |
+| **L3 cache** | 30-60 MB (shared) | 8-16 MB (per cluster) | 8-16 MB (per cluster) |
+| **TDP** | 150-250W (typical) | ~70W (10 cores, est.) | ~30W (10 cores, est.) |
 | **SVE2 PTRUE elimination** | N/A | **Removed** (overhead per use) | **Supported** (optimized away) |
 | **ARMv8.1-A QRDMX** | N/A | Yes | Yes |
 
@@ -181,38 +185,52 @@ The GB10 contains two distinct core types in a big.LITTLE configuration. Their v
 **Per-Core SIMD Throughput Comparison:**
 
 ```
-AVX-512 (Xeon @ 3.5 GHz):    2 ops/cycle x 512 bits = 1024 bits/cycle x 3.5 GHz = 3,584 Gbits/s
+Xeon 2 GHz (AVX-512):        2 ops/cycle x 512 bits = 1024 bits/cycle x 2.0 GHz = 2,048 Gbits/s
 Cortex-X925 (@ 4.0 GHz):     6 ops/cycle x 128 bits =  768 bits/cycle x 4.0 GHz = 3,072 Gbits/s
 Cortex-A725 (@ 2.8 GHz):     2 ops/cycle x 128 bits =  256 bits/cycle x 2.8 GHz =   717 Gbits/s
 ```
 
 **Relative per-core SIMD throughput:**
 
-| Core | Bits/cycle | Throughput (@ clock) | Relative to AVX-512 |
+| Core | Bits/cycle | Throughput (@ clock) | Relative to Xeon 2 GHz |
 |---|---|---|---|
-| **Xeon AVX-512** | 1024 | 3,584 Gbits/s | 1.00x (baseline) |
-| **Cortex-X925** | 768 | 3,072 Gbits/s | **0.86x** |
-| **Cortex-A725** | 256 | 717 Gbits/s | **0.20x** |
+| **Xeon 2 GHz (AVX-512)** | 1024 | 2,048 Gbits/s | 1.00x (baseline) |
+| **Cortex-X925** | 768 | 3,072 Gbits/s | **1.50x (faster)** |
+| **Cortex-A725** | 256 | 717 Gbits/s | **0.35x** |
 
 **Key observations:**
 
-1. **X925 is surprisingly competitive with AVX-512** on a per-core basis. The 6 SIMD pipes at 4.0 GHz compensate for the 4x narrower vector width, achieving 86% of Xeon AVX-512 throughput per core.
+1. **X925 exceeds per-core Xeon 2 GHz throughput by 1.5x.** The 6 SIMD pipes at 4.0 GHz more than compensate for the 4x narrower vector width. At 2.0 GHz base clock, the Xeon's wider vectors cannot keep up with the X925's combination of more pipes and 2x higher clock.
 
 2. **A725 is 4.3x slower than X925** for SIMD workloads — a combination of 3x fewer SIMD pipes (2 vs 6) and lower clock speed (2.8 vs 4.0 GHz). This makes A725 cores **unsuitable for real-time PHY processing**.
 
-3. **A725 has an advantage:** SVE2 PTRUE elimination is supported on A725 but removed on X925. This means SVE2 predicated loops may have slightly less overhead on A725 relative to its baseline, though this doesn't compensate for the 4.3x throughput gap.
+3. **A725 is 2.9x slower than a single Xeon 2 GHz core.** Despite the Xeon's low clock, its 512-bit vectors still dominate A725's 2 x 128-bit pipes.
 
-#### 4.1.4 Aggregate GB10 SIMD Budget
+4. **A725 has one advantage:** SVE2 PTRUE elimination is supported on A725 but removed on X925. This means SVE2 predicated loops may have slightly less overhead on A725 relative to its baseline, though this doesn't compensate for the throughput gap.
 
-| Core Group | Cores | Per-Core Bits/cycle | Aggregate Bits/cycle | Recommended Use |
-|---|---|---|---|---|
-| **X925 (Cluster 1)** | 5 @ 4.0 GHz | 768 | 3,840 | **PHY real-time** (LDPC, FFT, chan est.) |
-| **X925 (Cluster 0)** | 5 @ 3.9 GHz | 768 | 3,840 | PHY overflow, Tpool workers |
-| **A725 (all)** | 10 @ 2.8 GHz | 256 | 2,560 | OS, networking, L2/L3, control plane |
-| **GB10 Total** | 20 | -- | **10,240** | |
-| **For comparison: Xeon (4 cores)** | 4 @ 3.5 GHz | 1024 | 4,096 | Typical OAI reference config |
+#### 4.1.4 Aggregate SIMD Budget: Xeon 32-Core vs GB10
 
-The 10 X925 cores provide **7,680 bits/cycle aggregate** — nearly 2x the SIMD throughput of a typical 4-core Xeon AVX-512 configuration. The 10 A725 cores add 2,560 bits/cycle for non-critical workloads.
+| Core Group | Cores | Per-Core Bits/cycle | Clock | Aggregate Gbits/s | Recommended Use |
+|---|---|---|---|---|---|
+| **Xeon 2 GHz (all cores)** | 32 @ 2.0 GHz | 1024 | 2.0 GHz | **65,536** | Full server |
+| **Xeon 2 GHz (4 cores, typical OAI)** | 4 @ 2.0 GHz | 1024 | 2.0 GHz | **8,192** | Typical OAI config |
+| | | | | | |
+| **X925 (Cluster 1)** | 5 @ 4.0 GHz | 768 | 4.0 GHz | **15,360** | **PHY real-time** (LDPC, FFT, chan est.) |
+| **X925 (Cluster 0)** | 5 @ 3.9 GHz | 768 | 3.9 GHz | **14,976** | PHY overflow, Tpool workers |
+| **X925 (all 10)** | 10 | 768 | ~4.0 GHz | **30,336** | |
+| **A725 (all 10)** | 10 @ 2.8 GHz | 256 | 2.8 GHz | **7,168** | OS, networking, L2/L3, control plane |
+| **GB10 Total (1 node)** | 20 | -- | -- | **37,504** | |
+| **GB10 Total (2 nodes stacked)** | 40 | -- | -- | **75,008** | |
+
+**Key comparisons:**
+
+- **10 X925 cores (30,336 Gbits/s) vs 4 Xeon cores (8,192 Gbits/s):** GB10's performance cores deliver **3.7x the SIMD throughput** of a typical 4-core OAI Xeon configuration. Even accounting for the 4x narrower vectors requiring more instructions, the X925 cores have a decisive advantage.
+
+- **10 X925 cores vs all 32 Xeon cores (65,536 Gbits/s):** The full 32-core Xeon still provides **2.2x more aggregate SIMD throughput** than the 10 X925 cores. However, OAI UE workloads rarely scale to 32 cores effectively — the practical comparison is 4-8 Xeon cores vs 10 X925 cores.
+
+- **10 A725 cores (7,168 Gbits/s) vs 4 Xeon cores (8,192 Gbits/s):** A725 cores are roughly equivalent to 3.5 Xeon 2 GHz cores in aggregate SIMD throughput — adequate for non-PHY workloads but insufficient for real-time DSP.
+
+- **2-node GB10 cluster (75,008 Gbits/s) vs 32-core Xeon (65,536 Gbits/s):** A stacked dual-node GB10 cluster slightly exceeds the full 32-core Xeon in aggregate, while adding 2 Blackwell GPUs for CUDA offload.
 
 #### 4.1.5 Implications for OAI Thread Placement
 
