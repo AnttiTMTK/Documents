@@ -139,19 +139,97 @@ This is the most labor-intensive challenge. OAI PHY is heavily optimized with x8
 
 ### 4.1 Architecture Comparison
 
-| Feature | AVX-512 | ARM NEON | ARM SVE2 (X925) |
+#### 4.1.1 Instruction Set Comparison: AVX-512 vs NEON vs SVE2
+
+| Feature | AVX-512 | ARM NEON | ARM SVE2 (X925/A725) |
 |---|---|---|---|
-| **Register width** | 512-bit (ZMM0-31) | 128-bit (Q0-Q31) | 128-bit (scalable, but X925 implements 128-bit) |
+| **Register width** | 512-bit (ZMM0-31) | 128-bit (Q0-Q31) | 128-bit (scalable, but GB10 implements 128-bit) |
 | **Register count** | 32 x 512-bit | 32 x 128-bit | 32 x scalable + 16 predicate |
-| **Throughput ratio** | 64 bytes/op | 16 bytes/op (4x narrower) | 16 bytes/op on X925 |
-| **SIMD pipes (X925)** | 2 x 512-bit (typical Xeon) | 6 x 128-bit | 6 x 128-bit |
-| **Effective ops/cycle** | 2 (x 512-bit = 1024 bits) | 6 (x 128-bit = 768 bits) | 6 (x 128-bit = 768 bits) |
-| **FMA** | vfmadd (FP32/FP64) | FMLA (FP16/FP32/FP64) | FMLA + complex MLA |
+| **Throughput ratio** | 64 bytes/op | 16 bytes/op (4x narrower) | 16 bytes/op on GB10 |
+| **FMA** | vfmadd (FP32/FP64) | FMLA (FP16/FP32/FP64) | FMLA + complex MLA (FCMLA) |
 | **Masking/Predication** | 8 opmask registers (k0-k7) | Bitwise select (VBSL) | 16 predicate registers (P0-P15) |
 | **Saturating arithmetic** | Separate instructions | First-class "Q" variants | First-class + wider ops |
 | **Shuffle/Permute** | Rich (vpermi2, vpshufb) | TBL/TBX (128-bit only) | TBL + SPLICE |
 | **Horizontal ops** | hadd, hsub, dpbusd | Limited pairwise add | ADDV, FADDV reductions |
 | **Gather/Scatter** | All element sizes | Not available | 32/64-bit elements only |
+
+#### 4.1.2 Core Microarchitecture Comparison: AVX-512 (Xeon) vs Cortex-X925 vs Cortex-A725
+
+The GB10 contains two distinct core types in a big.LITTLE configuration. Their vector capabilities differ significantly:
+
+| Feature | Intel Xeon (AVX-512) | Cortex-X925 (Performance) | Cortex-A725 (Efficiency) |
+|---|---|---|---|
+| **Architecture** | x86-64 | ARMv9.2-A | ARMv9.2-A |
+| **Role in GB10** | N/A (reference) | Performance cores (10x) | Efficiency cores (10x) |
+| **Clock frequency (GB10)** | 3.0-4.0 GHz (typical Xeon) | 3.9-4.0 GHz | 2.8 GHz |
+| **Decode width** | 6-wide (typical) | 10-wide | 5-wide |
+| **SIMD/Vector pipes** | 2 x 512-bit | **6 x 128-bit** | **2 x 128-bit** |
+| **Effective SIMD bits/cycle** | 1024 bits | **768 bits** | **256 bits** |
+| **NEON/SVE2 support** | N/A | NEON + SVE2 (128-bit) | NEON + SVE2 (128-bit) |
+| **FP/Vector scheduling queues** | Varies by impl. | 6 pipes, deep queues | 2 pipes, 16-entry queues each |
+| **Integer ALU pipes** | Varies | 8 ports | 4 ports |
+| **Load/Store units** | 2-3 (typical) | 4 load units | 3 AGU pipes |
+| **Reorder buffer** | 512+ entries (typical) | ~400+ entries (est.) | 224 entries |
+| **L1D cache** | 48 KB (typical) | 64 KB, 4-cycle | 64 KB, 4-cycle |
+| **L2 cache** | 1.25-2 MB (typical) | 2 MB, 12-cycle | 512 KB, 9-cycle |
+| **L3 cache (GB10)** | 30-60 MB (typical Xeon) | 8-16 MB (shared cluster) | 8-16 MB (shared cluster) |
+| **SVE2 PTRUE elimination** | N/A | **Removed** (overhead per use) | **Supported** (optimized away) |
+| **ARMv8.1-A QRDMX** | N/A | Yes | Yes |
+
+#### 4.1.3 Vector Throughput Analysis
+
+**Per-Core SIMD Throughput Comparison:**
+
+```
+AVX-512 (Xeon @ 3.5 GHz):    2 ops/cycle x 512 bits = 1024 bits/cycle x 3.5 GHz = 3,584 Gbits/s
+Cortex-X925 (@ 4.0 GHz):     6 ops/cycle x 128 bits =  768 bits/cycle x 4.0 GHz = 3,072 Gbits/s
+Cortex-A725 (@ 2.8 GHz):     2 ops/cycle x 128 bits =  256 bits/cycle x 2.8 GHz =   717 Gbits/s
+```
+
+**Relative per-core SIMD throughput:**
+
+| Core | Bits/cycle | Throughput (@ clock) | Relative to AVX-512 |
+|---|---|---|---|
+| **Xeon AVX-512** | 1024 | 3,584 Gbits/s | 1.00x (baseline) |
+| **Cortex-X925** | 768 | 3,072 Gbits/s | **0.86x** |
+| **Cortex-A725** | 256 | 717 Gbits/s | **0.20x** |
+
+**Key observations:**
+
+1. **X925 is surprisingly competitive with AVX-512** on a per-core basis. The 6 SIMD pipes at 4.0 GHz compensate for the 4x narrower vector width, achieving 86% of Xeon AVX-512 throughput per core.
+
+2. **A725 is 4.3x slower than X925** for SIMD workloads — a combination of 3x fewer SIMD pipes (2 vs 6) and lower clock speed (2.8 vs 4.0 GHz). This makes A725 cores **unsuitable for real-time PHY processing**.
+
+3. **A725 has an advantage:** SVE2 PTRUE elimination is supported on A725 but removed on X925. This means SVE2 predicated loops may have slightly less overhead on A725 relative to its baseline, though this doesn't compensate for the 4.3x throughput gap.
+
+#### 4.1.4 Aggregate GB10 SIMD Budget
+
+| Core Group | Cores | Per-Core Bits/cycle | Aggregate Bits/cycle | Recommended Use |
+|---|---|---|---|---|
+| **X925 (Cluster 1)** | 5 @ 4.0 GHz | 768 | 3,840 | **PHY real-time** (LDPC, FFT, chan est.) |
+| **X925 (Cluster 0)** | 5 @ 3.9 GHz | 768 | 3,840 | PHY overflow, Tpool workers |
+| **A725 (all)** | 10 @ 2.8 GHz | 256 | 2,560 | OS, networking, L2/L3, control plane |
+| **GB10 Total** | 20 | -- | **10,240** | |
+| **For comparison: Xeon (4 cores)** | 4 @ 3.5 GHz | 1024 | 4,096 | Typical OAI reference config |
+
+The 10 X925 cores provide **7,680 bits/cycle aggregate** — nearly 2x the SIMD throughput of a typical 4-core Xeon AVX-512 configuration. The 10 A725 cores add 2,560 bits/cycle for non-critical workloads.
+
+#### 4.1.5 Implications for OAI Thread Placement
+
+The 4.3x SIMD throughput gap between X925 and A725 reinforces the thread pinning strategy:
+
+| Workload | Required Core Type | Rationale |
+|---|---|---|
+| PHY RX/TX thread | X925 only | Hard real-time, SIMD-intensive |
+| LDPC decoder threads | X925 only | Saturating arithmetic, shuffles — needs all 6 SIMD pipes |
+| DFT/IDFT (OFDM) | X925 only | Complex butterfly ops, high SIMD throughput needed |
+| Channel estimation | X925 preferred | Complex multiply-accumulate benefits from 6 pipes |
+| MAC/RLC/PDCP/RRC | A725 sufficient | Primarily scalar, no SIMD requirement |
+| NAS/IP stack | A725 sufficient | Network protocol processing, no SIMD |
+| OS/IRQ handling | A725 only | Keep off performance cores entirely |
+| CUDA management | Either | GPU kernel launch, memory sync — not SIMD bound |
+
+**Critical rule:** Never schedule SIMD-intensive PHY threads on A725 cores. The 4.3x throughput penalty would cause slot deadline misses even if the algorithm is functionally correct.
 
 ### 4.2 Key Porting Challenges
 
