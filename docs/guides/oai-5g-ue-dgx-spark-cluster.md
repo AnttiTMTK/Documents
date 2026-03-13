@@ -36,7 +36,7 @@
 | **GPU** | NVIDIA Blackwell, 6,144 CUDA cores, 1 PFLOP FP4 sparse |
 | **Memory** | 128 GB LPDDR5x unified (CPU+GPU shared), 273 GB/s |
 | **Storage** | Up to 4 TB NVMe PCIe 4.0/5.0 |
-| **Networking** | ConnectX-7 SmartNIC (QSFP28, up to 200 GbE) |
+| **Networking** | ConnectX-7 SmartNIC, 2x QSFP112 ports (up to 200 GbE) |
 | **Architecture** | ARMv9.2-A, NEON (mandatory), SVE2 (128-bit implementation) |
 | **OS** | DGX OS 7.4.0 (Ubuntu 24.04 LTS), Kernel 6.17 |
 | **GPU Driver** | 580.126.09, CUDA 13.0.2 |
@@ -614,8 +614,7 @@ X925 Cluster 0 Cores (10-12):
 **For production real-time:** USRP X410 via ConnectX-7 QSFP28
 - Lowest latency, highest bandwidth
 - Native match with DGX Spark's ConnectX-7 ports
-- **Tradeoff:** Uses one QSFP port, leaving one for stacking (DGX Spark has 2, GX10 has 1)
-- **GX10 limitation:** Only 1 QSFP port -- cannot stack AND use X410. Use N310 via 10GbE instead.
+- **Tradeoff:** Uses one QSFP port, leaving one for stacking (both DGX Spark and GX10 have 2 QSFP ports)
 
 **For balanced setup (GX10):** USRP N310 via 10GbE RJ-45
 - Good bandwidth (100 MHz FR1), acceptable latency
